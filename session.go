@@ -65,6 +65,9 @@ type Session struct {
 	// or to send a header out directly.
 	sendCh chan sendReady
 
+	// sendDeadCh is closed when the sending thread has completed.
+	sendDeadCh chan struct{}
+
 	// recvDoneCh is closed when recv() exits to avoid a race
 	// between stream registration and stream shutdown
 	recvDoneCh chan struct{}
@@ -102,6 +105,7 @@ func newSession(config *Config, conn io.ReadWriteCloser, client bool) *Session {
 		synCh:      make(chan struct{}, config.AcceptBacklog),
 		acceptCh:   make(chan *Stream, config.AcceptBacklog),
 		sendCh:     make(chan sendReady, 64),
+		sendDeadCh: make(chan struct{}),
 		recvDoneCh: make(chan struct{}),
 		shutdownCh: make(chan struct{}),
 	}
@@ -224,24 +228,35 @@ func (s *Session) AcceptStream() (*Stream, error) {
 // Attempts to send a GoAway before closing the connection.
 func (s *Session) Close() error {
 	s.shutdownLock.Lock()
-	defer s.shutdownLock.Unlock()
+	{
+		if s.shutdown {
+			s.shutdownLock.Unlock()
+			return nil
+		}
 
-	if s.shutdown {
-		return nil
+		s.shutdown = true
+
+		if s.shutdownErr == nil {
+			s.shutdownErr = ErrSessionShutdown
+		}
 	}
-	s.shutdown = true
-	if s.shutdownErr == nil {
-		s.shutdownErr = ErrSessionShutdown
-	}
+	s.shutdownLock.Unlock()
+
+	// only one goroutine can reach here
+
 	close(s.shutdownCh)
+	<-s.sendDeadCh
+
 	s.conn.Close()
 	<-s.recvDoneCh
 
 	s.streamLock.Lock()
 	defer s.streamLock.Unlock()
+
 	for _, stream := range s.streams {
 		stream.forceClose()
 	}
+
 	return nil
 }
 
@@ -395,39 +410,59 @@ func (s *Session) sendNoWait(hdr header) error {
 
 // send is a long running goroutine that sends data
 func (s *Session) send() {
-	for {
+	handle := (func(ready sendReady) bool {
+		// Send a header if ready
+		if ready.Hdr != nil {
+			sent := 0
+			for sent < len(ready.Hdr) {
+				n, err := s.conn.Write(ready.Hdr[sent:])
+				if err != nil {
+					s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
+					asyncSendErr(ready.Err, err)
+					close(s.sendDeadCh)
+					s.exitErr(err)
+					return true
+				}
+				sent += n
+			}
+		}
+
+		// Send data from a body if given
+		if ready.Body != nil {
+			_, err := io.Copy(s.conn, ready.Body)
+			if err != nil {
+				s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
+				asyncSendErr(ready.Err, err)
+				close(s.sendDeadCh)
+				s.exitErr(err)
+				return true
+			}
+		}
+
+		// No error, successful send
+		asyncSendErr(ready.Err, nil)
+
+		return false
+	})
+
+	done := false
+
+	for !done {
 		select {
 		case ready := <-s.sendCh:
-			// Send a header if ready
-			if ready.Hdr != nil {
-				sent := 0
-				for sent < len(ready.Hdr) {
-					n, err := s.conn.Write(ready.Hdr[sent:])
-					if err != nil {
-						s.logger.Printf("[ERR] yamux: Failed to write header: %v", err)
-						asyncSendErr(ready.Err, err)
-						s.exitErr(err)
-						return
-					}
-					sent += n
-				}
-			}
+			done = handle(ready)
 
-			// Send data from a body if given
-			if ready.Body != nil {
-				_, err := io.Copy(s.conn, ready.Body)
-				if err != nil {
-					s.logger.Printf("[ERR] yamux: Failed to write body: %v", err)
-					asyncSendErr(ready.Err, err)
-					s.exitErr(err)
-					return
-				}
-			}
-
-			// No error, successful send
-			asyncSendErr(ready.Err, nil)
 		case <-s.shutdownCh:
-			return
+			for !done {
+				select {
+				case ready := <-s.sendCh:
+					done = handle(ready)
+
+				default:
+					close(s.sendDeadCh)
+					done = true
+				}
+			}
 		}
 	}
 }
@@ -531,7 +566,7 @@ func (s *Session) handleStreamMessage(hdr header) error {
 	return nil
 }
 
-// handlePing is invokde for a typePing frame
+// handlePing is invoked for a typePing frame
 func (s *Session) handlePing(hdr header) error {
 	flags := hdr.Flags()
 	pingID := hdr.Length()

@@ -12,7 +12,16 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"net/http"
+	_ "net/http/pprof"
 )
+
+func init() {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+}
 
 type logCapture struct{ bytes.Buffer }
 
@@ -985,6 +994,7 @@ func TestKeepAlive_Timeout(t *testing.T) {
 	// Prevent the client from responding
 	clientConn := client.conn.(*pipeConn)
 	clientConn.writeBlocker.Lock()
+	defer clientConn.writeBlocker.Unlock()
 
 	select {
 	case err := <-errCh:
@@ -1191,6 +1201,7 @@ func TestSession_WindowUpdateWriteDuringRead(t *testing.T) {
 
 		conn := client.conn.(*pipeConn)
 		conn.writeBlocker.Lock()
+		defer conn.writeBlocker.Unlock()
 
 		_, err = stream.Read(make([]byte, flood))
 		if err != ErrConnectionWriteTimeout {
@@ -1250,6 +1261,10 @@ func TestSession_PartialReadWindowUpdate(t *testing.T) {
 
 	_, err = stream.Read(make([]byte, flood/2+1))
 
+	if err != nil {
+		t.Fatalf("read error: %v", err)
+	}
+
 	if exp := uint32(flood/2 + 1); wr.sendWindow != exp {
 		t.Errorf("sendWindow: exp=%d, got=%d", exp, wr.sendWindow)
 	}
@@ -1286,6 +1301,7 @@ func TestSession_sendNoWait_Timeout(t *testing.T) {
 
 		conn := client.conn.(*pipeConn)
 		conn.writeBlocker.Lock()
+		defer conn.writeBlocker.Unlock()
 
 		hdr := header(make([]byte, headerSize))
 		hdr.encode(typePing, flagACK, 0, 0)
@@ -1330,6 +1346,7 @@ func TestSession_PingOfDeath(t *testing.T) {
 		defer stream.Close()
 
 		conn.writeBlocker.Lock()
+
 		for {
 			hdr := header(make([]byte, headerSize))
 			hdr.encode(typePing, 0, 0, 0)
@@ -1406,6 +1423,7 @@ func TestSession_ConnectionWriteTimeout(t *testing.T) {
 
 		conn := client.conn.(*pipeConn)
 		conn.writeBlocker.Lock()
+		defer conn.writeBlocker.Unlock()
 
 		// Since the write goroutine is blocked then this will return a
 		// timeout since it can't get feedback about whether the write
