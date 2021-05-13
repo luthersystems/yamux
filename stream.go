@@ -97,13 +97,24 @@ START:
 	case streamRemoteClose:
 		fallthrough
 	case streamClosed:
+		s.stateLock.Unlock()
 		s.recvLock.Lock()
 		if s.recvBuf == nil || s.recvBuf.Len() == 0 {
 			s.recvLock.Unlock()
-			s.stateLock.Unlock()
 			return 0, io.EOF
+		} else {
+			n, err := s.recvBuf.Read(b)
+			s.recvLock.Unlock()
+			if err == nil {
+				err = s.sendWindowUpdate()
+				if err == ErrStreamClosed || err == ErrSessionShutdown || err == io.ErrClosedPipe {
+					// ignore these errors as there is a possibility of
+					// the stream/session closing concurrently
+					err = nil
+				}
+			}
+			return n, err
 		}
-		s.recvLock.Unlock()
 	case streamReset:
 		s.stateLock.Unlock()
 		return 0, ErrConnectionReset
@@ -123,6 +134,11 @@ START:
 
 	// Send a window update potentially
 	err = s.sendWindowUpdate()
+	if err == ErrStreamClosed || err == ErrSessionShutdown || err == io.ErrClosedPipe {
+		// ignore these errors as there is a possibility of
+		// the stream/session closing concurrently
+		err = nil
+	}
 	return n, err
 
 WAIT:

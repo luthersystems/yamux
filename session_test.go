@@ -12,7 +12,16 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"net/http"
+	_ "net/http/pprof"
 )
+
+func init() {
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
+}
 
 type logCapture struct{ bytes.Buffer }
 
@@ -985,6 +994,7 @@ func TestKeepAlive_Timeout(t *testing.T) {
 	// Prevent the client from responding
 	clientConn := client.conn.(*pipeConn)
 	clientConn.writeBlocker.Lock()
+	defer clientConn.writeBlocker.Unlock()
 
 	select {
 	case err := <-errCh:
@@ -1191,6 +1201,7 @@ func TestSession_WindowUpdateWriteDuringRead(t *testing.T) {
 
 		conn := client.conn.(*pipeConn)
 		conn.writeBlocker.Lock()
+		defer conn.writeBlocker.Unlock()
 
 		_, err = stream.Read(make([]byte, flood))
 		if err != ErrConnectionWriteTimeout {
@@ -1250,6 +1261,10 @@ func TestSession_PartialReadWindowUpdate(t *testing.T) {
 
 	_, err = stream.Read(make([]byte, flood/2+1))
 
+	if err != nil {
+		t.Fatalf("read error: %v", err)
+	}
+
 	if exp := uint32(flood/2 + 1); wr.sendWindow != exp {
 		t.Errorf("sendWindow: exp=%d, got=%d", exp, wr.sendWindow)
 	}
@@ -1286,6 +1301,7 @@ func TestSession_sendNoWait_Timeout(t *testing.T) {
 
 		conn := client.conn.(*pipeConn)
 		conn.writeBlocker.Lock()
+		defer conn.writeBlocker.Unlock()
 
 		hdr := header(make([]byte, headerSize))
 		hdr.encode(typePing, flagACK, 0, 0)
@@ -1330,6 +1346,7 @@ func TestSession_PingOfDeath(t *testing.T) {
 		defer stream.Close()
 
 		conn.writeBlocker.Lock()
+
 		for {
 			hdr := header(make([]byte, headerSize))
 			hdr.encode(typePing, 0, 0, 0)
@@ -1406,6 +1423,7 @@ func TestSession_ConnectionWriteTimeout(t *testing.T) {
 
 		conn := client.conn.(*pipeConn)
 		conn.writeBlocker.Lock()
+		defer conn.writeBlocker.Unlock()
 
 		// Since the write goroutine is blocked then this will return a
 		// timeout since it can't get feedback about whether the write
@@ -1420,4 +1438,66 @@ func TestSession_ConnectionWriteTimeout(t *testing.T) {
 	}()
 
 	wg.Wait()
+}
+
+// TestCloseSessionBytesSent verifies that if a user Write()s bytes to
+// a Stream, those bytes are sent, even if the user calls
+// Session.Close() right after writing the bytes.
+func TestCloseSessionBytesSent(t *testing.T) {
+	client, server := testClientServerConfig(testConfNoKeepAlive())
+	defer client.Close()
+	defer server.Close()
+
+	conn1, err := client.Open()
+	if err != nil {
+		t.Fatalf("err: %v", err)
+	}
+
+	totalReceived := 0
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// Read bytes from stream until EOF.
+		conn2, err := server.Accept()
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		log.Printf("accepted stream\n")
+
+		buf := make([]byte, 4096)
+		for {
+			n, err := conn2.Read(buf)
+			totalReceived += n
+			log.Printf("read %d bytes\n", n)
+			if err == io.EOF {
+				log.Printf("read EOF\n")
+				break
+			} else if err != nil {
+				t.Fatalf("unexpected err: %v", err)
+				break
+			}
+		}
+	}()
+
+	totalSent := 0
+	for i := 0; i < 100; i++ {
+		buf := make([]byte, 4096)
+		n, err := conn1.Write(buf)
+		if err != nil {
+			t.Fatalf("could not write: %v", err)
+		}
+		totalSent += n
+	}
+	if err := conn1.Close(); err != nil {
+		t.Fatalf("failed to close stream: %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("failed to close client session: %v", err)
+	}
+
+	wg.Wait()
+	if totalSent != totalReceived {
+		t.Fatalf("totalSent %d should equal totalReceived %d", totalSent, totalReceived)
+	}
 }
